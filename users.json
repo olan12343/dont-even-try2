@@ -1,0 +1,29 @@
+{
+    "1008385559": {
+        "username": "nofumez",
+        "balance": 0.42321892342641454,
+        "total_bets": 0.0,
+        "total_wins": 0.0,
+        "games_played": 0,
+        "deposit_history": [],
+        "withdraw_history": []
+    },
+    "5011863881": {
+        "username": "fldsis",
+        "balance": 0.0,
+        "total_bets": 0.0,
+        "total_wins": 0.0,
+        "games_played": 0,
+        "deposit_history": [],
+        "withdraw_history": []
+    },
+    "6540061261": {
+        "username": "oxoke",
+        "balance": 0.0,
+        "total_bets": 0.0,
+        "total_wins": 0.0,
+        "games_played": 0,
+        "deposit_history": [],
+        "withdraw_history": []
+    }
+}
