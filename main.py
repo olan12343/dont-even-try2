@@ -409,12 +409,12 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, reply_m
                 logger.warning(f"Rate limit exceeded, waiting {retry_after} seconds (attempt {attempt + 1}/{retries})")
                 time.sleep(retry_after)
             else:
-                logger.error(f"Ошибка отправки сообщения в чат {chat_id}: {str(e)}")
+                logger.error(f"Ошибка BadRequest при отправке сообщения в чат {chat_id}: {str(e)}")
                 return None
         except Exception as e:
             logger.error(f"Неожиданная ошибка при отправке сообщения в чат {chat_id}: {str(e)}")
             if attempt < retries - 1:
-                time.sleep(2)  # Increased delay to avoid hammering API
+                time.sleep(2)
                 continue
             return None
     logger.error(f"Не удалось отправить сообщение в чат {chat_id} после {retries} попыток")
@@ -1413,15 +1413,31 @@ def dice_bet(update: Update, context: CallbackContext) -> int:
         ],
         [InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]
     ]
-    if safe_send_message(
+    # Используем safe_send_message и проверяем результат
+    result = safe_send_message(
         context,
         chat_id,
         f"🎲 Ваша ставка: {bet_amount:.2f} $ (@{user.username})\n\nВыберите тип ставки:",
-        InlineKeyboardMarkup(keyboard)
-    ):
-        message = context.bot.get_updates()[-1].message
-        active_dice_games[user_id]['message_id'] = message.message_id
-        active_dice_games[user_id]['chat_id'] = message.chat_id
+        InlineKeyboardMarkup(keyboard),
+        parse_mode='Markdown'
+    )
+    if result:
+        active_dice_games[user_id]['message_id'] = result['message_id']
+        active_dice_games[user_id]['chat_id'] = result['chat_id']
+        logger.info(f"Сообщение успешно отправлено для пользователя {user_id}, message_id={result['message_id']}")
+    else:
+        logger.error(f"Не удалось отправить сообщение для игры Кости пользователю {user_id}")
+        # Очищаем состояние игры, чтобы пользователь мог начать заново
+        if user_id in active_dice_games:
+            del active_dice_games[user_id]
+        safe_send_message(
+            context,
+            chat_id,
+            "❌ Произошла ошибка при отправке сообщения. Пожалуйста, попробуйте снова.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]])
+        )
+        return ConversationHandler.END
+    context.user_data['__current_conversation_state'] = None
     return ConversationHandler.END
 
 def dice_choice(update: Update, context: CallbackContext) -> None:
@@ -1448,7 +1464,7 @@ def dice_choice(update: Update, context: CallbackContext) -> None:
     if user_id not in active_dice_games:
         safe_edit_message(
             query,
-            text="Игра уже завершена.",
+            text="Игра уже завершена или не начата.",
             reply_markup=InlineKeyboardMarkup([
                 [InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]
             ])
@@ -1489,16 +1505,17 @@ def dice_choice(update: Update, context: CallbackContext) -> None:
             f"Результат: {dice_result}\n"
             f"Ставка: {game['bet']:.2f} $"
         )
-    safe_edit_message(
-        query,
-        text=result_text,
-        reply_markup=InlineKeyboardMarkup([
-            [InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]
-        ])
-    )
+    if not safe_edit_message(query, result_text, InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]]), 'Markdown'):
+        safe_send_message(
+            context,
+            game['chat_id'],
+            result_text,
+            InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]]),
+            'Markdown'
+        )
     if user_id in active_dice_games:
         del active_dice_games[user_id]
-
+        
 def admin_panel(update: Update, context: CallbackContext) -> None:
     """Админ-панель"""
     query = update.callback_query
