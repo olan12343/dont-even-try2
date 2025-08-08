@@ -61,11 +61,11 @@ active_invoices = {}
 
 # Настройки для ракетки
 ROCKET_CRASH_PROBABILITIES = [
-    (1.0, 0.70),
-    (1.5, 0.85),
-    (3.0, 0.95),
-    (5.0, 0.99),
-    (25.0, 1.0)
+    (1.1, 0.10),  # 10% шанс краша на x1.0–x1.1
+    (1.5, 0.30),  # 20% шанс краша на x1.1–x1.5
+    (3.0, 0.60),  # 30% шанс краша на x1.5–x3.0
+    (5.0, 0.90),  # 30% шанс краша на x3.0–x5.0
+    (25.0, 1.00)  # 10% шанс краша на x5.0–x25.0
 ]
 
 # Множители для Матрицы
@@ -404,19 +404,19 @@ def safe_send_message(context: CallbackContext, chat_id: int, text: str, reply_m
             logger.error(f"Пользователь {chat_id} заблокировал бота или не начал диалог")
             return None
         except BadRequest as e:
-            logger.error(f"Ошибка отправки сообщения в чат {chat_id}: {str(e)}")
-            return None
-        except Exception as e:
             if "retry after" in str(e).lower():
-                retry_after = int(str(e).split("retry after")[-1].strip())
-                logger.warning(f"Rate limit exceeded, retrying after {retry_after} seconds (attempt {attempt + 1}/{retries})")
+                retry_after = int(str(e).split("retry after")[-1].strip()) + 1
+                logger.warning(f"Rate limit exceeded, waiting {retry_after} seconds (attempt {attempt + 1}/{retries})")
                 time.sleep(retry_after)
             else:
-                logger.error(f"Неожиданная ошибка при отправке сообщения в чат {chat_id}: {str(e)}")
-                if attempt < retries - 1:
-                    time.sleep(1)
-                    continue
+                logger.error(f"Ошибка отправки сообщения в чат {chat_id}: {str(e)}")
                 return None
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при отправке сообщения в чат {chat_id}: {str(e)}")
+            if attempt < retries - 1:
+                time.sleep(2)  # Increased delay to avoid hammering API
+                continue
+            return None
     logger.error(f"Не удалось отправить сообщение в чат {chat_id} после {retries} попыток")
     return None
 
@@ -433,7 +433,6 @@ def safe_answer_query(query, text: str = None) -> bool:
         return False
 
 def safe_edit_message(query, text: str, reply_markup=None, parse_mode=None) -> bool:
-    """Безопасное редактирование сообщения"""
     try:
         query.edit_message_text(
             text=text,
@@ -786,7 +785,6 @@ def game_choice(update: Update, context: CallbackContext) -> int:
     return ConversationHandler.END
 
 def rocket_bet(update: Update, context: CallbackContext) -> int:
-    """Обработка ставки в игре Ракетка"""
     user_id = update.effective_user.id
     initiator_id = context.user_data.get('initiator_id')
     chat_id = context.user_data.get('chat_id', update.effective_chat.id)
@@ -798,6 +796,9 @@ def rocket_bet(update: Update, context: CallbackContext) -> int:
             InlineKeyboardMarkup([[InlineKeyboardButton("🔙 Назад", callback_data='play_game')]])
         )
         return ROCKET_BET
+    if user_id in active_rocket_games:
+        logger.warning(f"Пользователь {user_id} уже имеет активную игру Ракетка, завершаем старую")
+        del active_rocket_games[user_id]
     user = get_user(user_id)
     balance_type = 'virtual_balance' if user.use_virtual else 'balance'
     try:
@@ -841,12 +842,15 @@ def rocket_bet(update: Update, context: CallbackContext) -> int:
     for threshold, prob in ROCKET_CRASH_PROBABILITIES:
         if rand <= prob:
             if ROCKET_CRASH_PROBABILITIES.index((threshold, prob)) == 0:
-                crash_at = 1.0 + (threshold - 1.0) * rand / prob
+                # Для первого порога задаем диапазон, например, от 1.0 до threshold (1.1)
+                crash_at = 1.0 + (threshold - 1.0) * (rand / prob)
             else:
                 prev_threshold, prev_prob = ROCKET_CRASH_PROBABILITIES[ROCKET_CRASH_PROBABILITIES.index((threshold, prob)) - 1]
                 segment_prob = (rand - prev_prob) / (prob - prev_prob)
                 crash_at = prev_threshold + (threshold - prev_threshold) * segment_prob
             break
+    # Убедимся, что crash_at не меньше 1.01, чтобы избежать мгновенных крашей
+    crash_at = max(crash_at, 1.01)
     active_rocket_games[user_id] = {
         'bet': bet_amount,
         'multiplier': 1.0,
@@ -857,18 +861,23 @@ def rocket_bet(update: Update, context: CallbackContext) -> int:
         'balance_type': balance_type,
         'initiator_id': initiator_id
     }
+    logger.info(f"Инициализирована игра Ракетка для пользователя {user_id}: ставка={bet_amount}, crash_at={crash_at}")
     run_rocket_game(context, user_id)
+    context.user_data['__current_conversation_state'] = None
     return ConversationHandler.END
 
 def run_rocket_game(context: CallbackContext, user_id: int) -> None:
     """Запуск игры Ракетка"""
     game = active_rocket_games.get(user_id)
     if not game:
+        logger.error(f"Игра для пользователя {user_id} не найдена")
         return
     user = get_user(user_id)
     start_time = time.time()
-    crash_time = game['crash_at'] * 3
-    if not safe_send_message(
+    crash_time = game['crash_at'] * 3  # Time to reach crash multiplier
+
+    # Send initial message
+    result = safe_send_message(
         context,
         game['chat_id'],
         f"🚀 Ракетка взлетает! (@{user.username})\n\nСтавка: {game['bet']:.2f} $\nМножитель: x1.00",
@@ -876,43 +885,117 @@ def run_rocket_game(context: CallbackContext, user_id: int) -> None:
             [InlineKeyboardButton("💰 Забрать", callback_data=f'rocket_cashout_{user_id}')],
             [InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]
         ])
-    ):
+    )
+    if not result:
         logger.error(f"Не удалось отправить начальное сообщение для игры Ракетка пользователю {user_id}")
         del active_rocket_games[user_id]
+        safe_send_message(
+            context,
+            game['chat_id'],
+            "❌ Произошла ошибка при запуске игры. Пожалуйста, попробуйте позже.",
+            InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]])
+        )
         return
-    message = context.bot.get_updates()[-1].message
-    game['message_id'] = message.message_id
-    game['chat_id'] = message.chat_id
+    game['message_id'] = result['message_id']
+    game['chat_id'] = result['chat_id']
 
     def update_multiplier(context: CallbackContext):
+        """Обновление множителя и сообщения"""
         if user_id not in active_rocket_games:
+            logger.info(f"Игра для пользователя {user_id} завершена или удалена")
             return
         game = active_rocket_games[user_id]
         elapsed = time.time() - start_time
         current_multiplier = 1.0 + (game['crash_at'] - 1.0) * (elapsed / crash_time)
+        game['multiplier'] = current_multiplier
+
         if current_multiplier >= game['crash_at'] or game['crashed']:
             if not game['crashed']:
                 game['crashed'] = True
+                text = (
+                    f"💥 Ракетка взорвалась на x{game['multiplier']:.2f}! (@{user.username})\n\n"
+                    f"Ставка: {game['bet']:.2f} $\nВы проиграли."
+                )
+                reply_markup = InlineKeyboardMarkup([
+                    [InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]
+                ])
+                try:
+                    context.bot.edit_message_text(
+                        chat_id=game['chat_id'],
+                        message_id=game['message_id'],
+                        text=text,
+                        reply_markup=reply_markup,
+                        parse_mode='Markdown'
+                    )
+                except BadRequest as e:
+                    logger.warning(f"Не удалось отредактировать сообщение: {str(e)}")
+                    safe_send_message(context, game['chat_id'], text, reply_markup, 'Markdown')
+                finally:
+                    if user_id in active_rocket_games:
+                        del active_rocket_games[user_id]
+            return
+
+        # Update message with current multiplier
+        text = (
+            f"🚀 Ракетка летит! (@{user.username})\n\n"
+            f"Ставка: {game['bet']:.2f} $\nМножитель: x{game['multiplier']:.2f}"
+        )
+        reply_markup = InlineKeyboardMarkup([
+            [InlineKeyboardButton("💰 Забрать", callback_data=f'rocket_cashout_{user_id}')],
+            [InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]
+        ])
+        try:
+            context.bot.edit_message_text(
+                chat_id=game['chat_id'],
+                message_id=game['message_id'],
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode='Markdown'
+            )
+        except BadRequest as e:
+            if "Message is not modified" in str(e):
+                logger.debug(f"Сообщение не изменено для пользователя {user_id}")
+            elif "Message to edit not found" in str(e):
+                logger.warning(f"Сообщение не найдено, отправка нового для пользователя {user_id}")
+                result = safe_send_message(context, game['chat_id'], text, reply_markup, 'Markdown')
+                if result:
+                    game['message_id'] = result['message_id']
+                    game['chat_id'] = result['chat_id']
+                else:
+                    logger.error(f"Не удалось отправить новое сообщение для пользователя {user_id}")
+                    del active_rocket_games[user_id]
+                    safe_send_message(
+                        context,
+                        game['chat_id'],
+                        "❌ Произошла ошибка. Пожалуйста, попробуйте позже.",
+                        InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]])
+                    )
+                    return
+            else:
+                logger.error(f"Ошибка редактирования сообщения: {str(e)}")
+                del active_rocket_games[user_id]
                 safe_send_message(
                     context,
                     game['chat_id'],
-                    f"💥 Ракетка взорвалась на x{game['multiplier']:.2f}! (@{user.username})\n\nСтавка: {game['bet']:.2f} $\nВы проиграли.",
+                    "❌ Произошла ошибка. Пожалуйста, попробуйте позже.",
                     InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]])
                 )
-                if user_id in active_rocket_games:
-                    del active_rocket_games[user_id]
+                return
+        except Exception as e:
+            logger.error(f"Неожиданная ошибка при обновлении сообщения: {str(e)}")
+            del active_rocket_games[user_id]
+            safe_send_message(
+                context,
+                game['chat_id'],
+                "❌ Произошла ошибка. Пожалуйста, попробуйте позже.",
+                InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]])
+            )
             return
-        game['multiplier'] = current_multiplier
-        safe_send_message(
-            context,
-            game['chat_id'],
-            f"🚀 Ракетка летит! (@{user.username})\n\nСтавка: {game['bet']:.2f} $\nМножитель: x{game['multiplier']:.2f}",
-            InlineKeyboardMarkup([
-                [InlineKeyboardButton("💰 Забрать", callback_data=f'rocket_cashout_{user_id}')],
-                [InlineKeyboardButton("🔙 В меню", callback_data='back_to_menu')]
-            ])
-        )
-    context.job_queue.run_once(update_multiplier, 0.1)
+        # Schedule the next update
+        context.job_queue.run_once(update_multiplier, 0.5, context=context)
+
+    # Schedule the first update
+    context.job_queue.run_once(update_multiplier, 0.5, context=context)
 
 def rocket_cashout(update: Update, context: CallbackContext) -> None:
     """Обработка вывода выигрыша в игре Ракетка"""
@@ -1816,21 +1899,25 @@ def error_handler(update: Update, context: CallbackContext) -> None:
         chat_id = update.effective_chat.id if update.effective_chat else None
         if user_id and chat_id:
             # Clean up active game states
-            if user_id in active_matrix_games:
-                del active_matrix_games[user_id]
-                logger.info(f"Очищено состояние игры Матрица для пользователя {user_id}")
             if user_id in active_rocket_games:
-                del active_rocket_games[user_id]
                 logger.info(f"Очищено состояние игры Ракетка для пользователя {user_id}")
+                del active_rocket_games[user_id]
+            if user_id in active_matrix_games:
+                logger.info(f"Очищено состояние игры Матрица для пользователя {user_id}")
+                del active_matrix_games[user_id]
             if user_id in active_dice_games:
-                del active_dice_games[user_id]
                 logger.info(f"Очищено состояние игры Кости для пользователя {user_id}")
-            safe_send_message(
-                context,
-                chat_id,
-                "❌ Произошла ошибка. Пожалуйста, попробуйте позже.",
-                InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]])
-            )
+                del active_dice_games[user_id]
+            # Send error message only if no recent error message was sent
+            if not hasattr(context, 'last_error_time') or (time.time() - context.last_error_time) > 5:
+                safe_send_message(
+                    context,
+                    chat_id,
+                    "❌ Произошла ошибка. Пожалуйста, попробуйте позже.",
+                    InlineKeyboardMarkup([[InlineKeyboardButton("🎮 В меню", callback_data='back_to_menu')]])
+                )
+                context.last_error_time = time.time()
+
 def main() -> None:
     """Запуск бота"""
     try:
